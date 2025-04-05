@@ -1,0 +1,340 @@
+#ifndef AIMER_BASE_MATH_FILTER_IMM_FILTER_HPP
+#define AIMER_BASE_MATH_FILTER_IMM_FILTER_HPP
+
+#include <array>
+#include <vector>
+#include "adaptive_ekf.hpp"
+#include "math.hpp"
+#include <Eigen/Dense>
+
+namespace aimer::math {
+    inline YpdCoord get_closest_ypd(const YpdCoord& meas, const YpdCoord& pred) {
+        return {
+            get_closest(meas.yaw, pred.yaw, 2*M_PI),
+            get_closest(meas.pitch, pred.pitch, 2*M_PI),
+            meas.dis
+        };
+    }
+
+    inline double multivariate_gaussian_pdf(
+        const Eigen::VectorXd& innov,
+        const Eigen::MatrixXd& S) 
+    {
+        const int n = innov.rows();
+        const double log2pi = std::log(2.0 * M_PI);
+        Eigen::LLT<Eigen::MatrixXd> llt(S);
+        if(llt.info() != Eigen::Success) {
+            return 0.0;
+        }
+        const double log_det = 2.0 * llt.matrixL().toDenseMatrix().diagonal().array().log().sum();
+        const Eigen::VectorXd alpha = llt.matrixL().solve(innov);
+        return std::exp(-0.5*(alpha.squaredNorm() + n*log2pi + log_det));
+    }
+}
+
+
+namespace aimer {
+
+// 修改基类接口声明
+class PositionPredictorInterface {
+public:
+    virtual ~PositionPredictorInterface() = default;
+    virtual Eigen::Vector3d predict_pos(const double& t) const = 0;
+    virtual Eigen::Vector3d predict_v(const double& t) const = 0;
+    virtual void init(const math::YpdCoord& ypd, double t) = 0;
+    virtual void update(const math::YpdCoord& ypd, double t,
+                       const std::vector<double>& q_vec,
+                       const std::vector<double>& r_vec) = 0;
+};
+    
+class IMMFilter : public PositionPredictorInterface {
+public:
+    using Ekf = AdaptiveEkf<9, 3>;  // 9维状态：x,vx,ax, y,vy,ay, z,vz,az
+
+    IMMFilter() {
+        // 初始化模型转移概率矩阵
+        transition_matrix_ << 0.8, 0.1, 0.1,
+                         0.1, 0.8, 0.1,
+                         0.1, 0.1, 0.8;
+
+        // 初始化模型概率
+        model_probs_ = Eigen::Vector3d(1.0/3.0, 1.0/3.0, 1.0/3.0);
+
+        // 初始化各模型参数
+        init_model_params();
+    }
+
+    void init(const math::YpdCoord& ypd, double t) override {
+        const Eigen::Vector3d pos = math::ypd_to_xyz(ypd);
+        Eigen::Matrix<double, 9, 1> x0;
+        x0 << pos.x(), 0.0, 0.0, 
+              pos.y(), 0.0, 0.0,
+              pos.z(), 0.0, 0.0;
+
+        for(auto& model : models_) {
+            model.ekf.init_x(x0);
+            model.t = t;
+        }
+        current_time_ = t;
+    }
+
+    Eigen::Vector3d predict_pos(const double& t) const override {
+        Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+        for(int i = 0; i < 3; ++i) {
+            const auto x = predict_model_state(models_[i], t);
+            pos += model_probs_(i) * Eigen::Vector3d(x[0], x[3], x[6]);
+        }
+        return pos;
+    }
+
+    Eigen::Vector3d predict_v(const double& t) const override {
+        Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+        for(int i = 0; i < 3; ++i) {
+            const auto x = predict_model_state(models_[i], t);
+            vel += model_probs_(i) * Eigen::Vector3d(x[1], x[4], x[7]);
+        }
+        return vel;
+    }
+
+    void update(const math::YpdCoord& ypd, double t,
+                const std::vector<double>& q_vec,
+                const std::vector<double>& r_vec) override 
+    {
+        // 1. 输入交互
+        mixing_interaction();
+        
+        // 2. 模型条件滤波
+        for(int i = 0; i < 3; ++i) {
+            auto& model = models_[i];
+            
+            // 预测步骤
+            const double dt = t - model.t;
+            predict_model(i, dt);
+
+            // 更新步骤
+            EkfMeasure meas_func;
+            const auto measure_res = model.ekf.measure(meas_func);
+            
+            // 处理角度缠绕
+            math::YpdCoord ypd_pred(measure_res.y_e(0), measure_res.y_e(1), measure_res.y_e(2));
+            math::YpdCoord ypd_meas = math::get_closest_ypd(ypd, ypd_pred);
+            
+            // 构建测量向量
+            Eigen::Vector3d y_meas(
+                math::get_closest(ypd_meas.yaw, ypd_pred.yaw, 2*M_PI),
+                math::get_closest(ypd_meas.pitch, ypd_pred.pitch, 2*M_PI),
+                ypd_meas.dis
+            );
+
+            model.ekf.update_forward(meas_func, y_meas, model.R);
+            model.t = t;
+            
+            // 计算似然
+            const Eigen::Vector3d innov = y_meas - measure_res.y_e;
+            model.likelihood = math::multivariate_gaussian_pdf(innov, measure_res.S);
+        }
+
+        // 3. 更新模型概率
+        update_model_probabilities();
+        current_time_ = t;
+    }
+
+    Eigen::Vector3d get_model_probabilities() const {
+        return model_probs_;
+    }
+
+private:
+    struct Model {
+        Ekf ekf;
+        double t = 0.0;
+        Eigen::MatrixXd Q;  // 过程噪声协方差
+        Eigen::Matrix3d R;  // 观测噪声协方差
+        double likelihood = 0.0;
+    };
+
+    std::array<Model, 3> models_;       // 0:静止 1:匀速 2:匀加速
+    Eigen::Matrix3d transition_matrix_; // 模型转移概率
+    Eigen::Vector3d model_probs_;       // 模型概率
+    double current_time_ = 0.0;
+
+    // 运动模型预测函数
+    struct StationaryPredict {
+        explicit StationaryPredict(double dt) : dt(dt) {}
+        template<typename T>
+        void operator()(const T x[9], T x_new[9]) const {
+            // 静止模型：所有状态保持不变
+            for(int i=0; i<9; ++i) x_new[i] = x[i];
+        }
+        double dt;
+    };
+
+    struct ConstantVelocityPredict {
+        explicit ConstantVelocityPredict(double dt) : dt(dt) {}
+        template<typename T>
+        void operator()(const T x[9], T x_new[9]) const {
+            // x轴
+            x_new[0] = x[0] + x[1] * dt;
+            x_new[1] = x[1];  // 匀速
+            x_new[2] = T(0);  // 加速度清零
+            
+            // y轴
+            x_new[3] = x[3] + x[4] * dt;
+            x_new[4] = x[4];
+            x_new[5] = T(0);
+            
+            // z轴
+            x_new[6] = x[6] + x[7] * dt;
+            x_new[7] = x[7];
+            x_new[8] = T(0);
+        }
+        double dt;
+    };
+
+    struct ConstantAccelerationPredict {
+        explicit ConstantAccelerationPredict(double dt) : dt(dt) {}
+        template<typename T>
+        void operator()(const T x[9], T x_new[9]) const {
+            const T dt2 = T(dt) * T(dt);
+            // x轴
+            x_new[0] = x[0] + x[1]*dt + 0.5*x[2]*dt2;
+            x_new[1] = x[1] + x[2]*dt;
+            x_new[2] = x[2];  // 恒定加速度
+            
+            // y轴
+            x_new[3] = x[3] + x[4]*dt + 0.5*x[5]*dt2;
+            x_new[4] = x[4] + x[5]*dt;
+            x_new[5] = x[5];
+            
+            // z轴
+            x_new[6] = x[6] + x[7]*dt + 0.5*x[8]*dt2;
+            x_new[7] = x[7] + x[8]*dt;
+            x_new[8] = x[8];
+        }
+        double dt;
+    };
+
+    // 测量函数
+    struct EkfMeasure {
+        template<typename T>
+        void operator()(const T x[9], T y[3]) const {
+            T pos[3] = {x[0], x[3], x[6]};
+            math::ceres_xyz_to_ypd(pos, y);
+        }
+    };
+
+    void init_model_params() {
+        // 静止模型
+        models_[0].Q = Eigen::MatrixXd::Zero(9,9);
+        models_[0].Q.diagonal() << 0.01, 0.0, 0.0, 0.01, 0.0, 0.0, 0.01, 0.0, 0.0;
+        
+        // 匀速模型
+        models_[1].Q = Eigen::MatrixXd::Zero(9,9);
+        models_[1].Q.diagonal() << 0.1, 0.1, 0.0, 0.1, 0.1, 0.0, 0.1, 0.1, 0.0;
+        
+        // 匀加速模型
+        models_[2].Q = Eigen::MatrixXd::Zero(9,9);
+        models_[2].Q.diagonal() << 2.5, 1.8, 0.8,  // x轴：位置/速度/加速度噪声
+                             2.5, 1.8, 0.8,    // y轴
+                             2.5, 1.8, 0.8; 
+
+        // 观测噪声
+        for(auto& model : models_) {
+            model.R = Eigen::Matrix3d::Identity() * 0.08;
+        }
+    }
+
+    void mixing_interaction() {
+        Eigen::Vector3d c = transition_matrix_.transpose() * model_probs_;
+        
+        std::array<Eigen::Matrix<double,9,1>, 3> mixed_states;
+        std::array<Eigen::Matrix<double,9,9>, 3> mixed_covs;
+
+        // 混合状态计算
+        for(int j = 0; j < 3; ++j) {
+            mixed_states[j].setZero();
+            mixed_covs[j].setZero();
+
+            for(int i = 0; i < 3; ++i) {
+                double mu_ij = transition_matrix_(i,j) * model_probs_(i) / c(j);
+
+                const auto& xi = models_[i].ekf.get_x();
+                const auto& Pi = models_[i].ekf.get_P();
+
+                mixed_states[j] += mu_ij * xi;
+            }
+        }
+
+        // 混合协方差计算
+        for (int j = 0; j < 3; ++j) {
+            for (int i = 0; i < 3; ++i) {
+                double mu_ij = transition_matrix_(i,j) * model_probs_(i) / c(j);
+
+                const auto& xi = models_[i].ekf.get_x();
+                const auto& Pi = models_[i].ekf.get_P();
+                Eigen::Matrix<double, 9, 1> dx = xi - mixed_states[j];
+
+                mixed_covs[j] += mu_ij * (Pi + dx * dx.transpose());
+            }
+
+            // 更新模型状态
+            models_[j].ekf.set_x(mixed_states[j]);
+            models_[j].ekf.set_P(mixed_covs[j]);
+        }
+
+        // 更新模型概率
+        model_probs_ = c;
+    }
+
+    void update_model_probabilities() {
+        // 计算归一化因子
+        double total = 0.0;
+        Eigen::Vector3d probs;
+        for(int i = 0; i < 3; ++i) {
+            probs(i) = models_[i].likelihood * model_probs_.dot(transition_matrix_.col(i));
+            total += probs(i);
+        }
+
+        if(total < 1e-10) { // 防止除零
+            model_probs_ = Eigen::Vector3d::Constant(1.0/3.0);
+        } else {
+            model_probs_ = probs / total;
+        }
+    }
+
+    Eigen::Matrix<double,9,1> predict_model_state(const Model& model, double t) const {
+        const double dt = t - model.t;
+        if(dt <= 1e-6) return model.ekf.get_x();
+
+        if(&model == &models_[0]) {
+            StationaryPredict pred_func(dt);
+            return model.ekf.predict(pred_func).x_p;
+        }
+        else if(&model == &models_[1]) {
+            ConstantVelocityPredict pred_func(dt);
+            return model.ekf.predict(pred_func).x_p;
+        }
+        else {
+            ConstantAccelerationPredict pred_func(dt);
+            return model.ekf.predict(pred_func).x_p;
+        }
+    }
+
+    void predict_model(int model_idx, double dt) {
+        auto& model = models_[model_idx];
+        if(model_idx == 0) {
+            StationaryPredict pred_func(dt);
+            model.ekf.predict_forward(pred_func, model.Q);
+        } else if(model_idx == 1) {
+            ConstantVelocityPredict pred_func(dt);
+            model.ekf.predict_forward(pred_func, model.Q);
+        } else {
+            ConstantAccelerationPredict pred_func(dt);
+            model.ekf.predict_forward(pred_func, model.Q);
+        }
+    }
+};
+
+
+} // namespace aimer
+
+#endif // AIMER_BASE_MATH_FILTER_IMM_FILTER_HPP
