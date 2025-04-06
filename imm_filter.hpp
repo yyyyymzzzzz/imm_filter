@@ -55,10 +55,15 @@ public:
         // 初始化模型转移概率矩阵
         transition_matrix_ << 0.9, 0, 0.1,
                          0.0, 0.9, 0.1,
-                         0.04, 0.01, 0.95;
+                         0.05, 0.03, 0.92;
+        // transition_matrix_ << 1, 0, 0,
+        //                     0, 1, 0,
+        //                     0, 0, 1;
+        
 
         // 初始化模型概率
         model_probs_ = Eigen::Vector3d(1.0/3.0, 1.0/3.0, 1.0/3.0);
+        // model_probs_ = Eigen::Vector3d(0.0, 0.0, 1.0);
         model_prev_probs_ = model_probs_;
 
         // 初始化各模型参数
@@ -200,7 +205,7 @@ private:
             // x轴
             x_new[0] = x[0] + x[1]*dt + 0.5*x[2]*dt2;
             x_new[1] = x[1] + x[2]*dt;
-            x_new[2] = x[2];  // 恒定加速度
+            x_new[2] = x[2];
             
             // y轴
             x_new[3] = x[3] + x[4]*dt + 0.5*x[5]*dt2;
@@ -235,26 +240,26 @@ private:
         models_[2].Q = Eigen::MatrixXd::Zero(9,9);
 
         // 静止模型
-        models_[0].Q.diagonal() << 0.1, 0.01, 0.0,   // X轴
-                                0.1, 0.01, 0.0,   // Y轴
-                                0.1, 0.01, 0.0;   // Z轴
+        models_[0].Q.diagonal() << 5, 0, 0.0,   // X轴
+                                5, 0, 0.0,   // Y轴
+                                5, 0, 0.0;   // Z轴
 
         // 匀速模型（动态调整基础值）
-        models_[1].Q.diagonal() << 1.0, 0.5, 0.0,
-                                1.0, 0.5, 0.0,
-                                1.0, 0.5, 0.0;
+        models_[1].Q.diagonal() << 10, 5, 0.0,
+                                10, 5, 0.0,
+                                10, 5, 0.0;
 
         // 匀加速模型（考虑加速度变化率）
-        models_[2].Q.diagonal() << 1.5, 1.0, 0.5,
-                                1.5, 1.0, 0.5,
-                                1.5, 1.0, 0.5;
+        models_[2].Q.diagonal() << 15, 10, 5,
+                                15, 10, 5,
+                                15, 10, 5;
         // 观测噪声
         // for(auto& model : models_) {
         //     model.R = Eigen::Matrix3d::Identity() * 0.08;
         // }
         models_[0].R = Eigen::Matrix3d::Identity() * 0.02;
-        models_[1].R = Eigen::Matrix3d::Identity() * 0.06;
-        models_[2].R = Eigen::Matrix3d::Identity() * 0.1;
+        models_[1].R = Eigen::Matrix3d::Identity() * 0.02;
+        models_[2].R = Eigen::Matrix3d::Identity() * 0.02;
     }
 
     void mixing_interaction() {
@@ -297,6 +302,9 @@ private:
 
         // 更新模型概率
         model_probs_ = c;
+        // model_probs_(0) = 0;
+        // model_probs_(1) = 0;
+        // model_probs_(2) = 1;
     }
 
     void update_model_probabilities() {
@@ -305,7 +313,8 @@ private:
         Eigen::Vector3d probs;
         for(int i = 0; i < 3; ++i) {
             // probs(i) = models_[i].likelihood * model_probs_.dot(transition_matrix_.col(i));
-            probs(i) = models_[i].likelihood * model_probs_(i);
+            // probs(i) = models_[i].likelihood * model_probs_(i);
+            probs(i) = models_[i].likelihood * (transition_matrix_.col(i).dot(model_prev_probs_));
             total += probs(i);
         }
 
@@ -317,6 +326,7 @@ private:
             // model_prev_probs_ = model_probs_;
             model_probs_ = probs / total;
         }
+        model_prev_probs_ = model_probs_;
     }
 
     Eigen::Matrix<double,9,1> predict_model_state(const Model& model, double t) const {

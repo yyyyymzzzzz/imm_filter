@@ -48,9 +48,9 @@ std::vector<math::YpdCoord> generate_measurements(double dt, double total_time) 
         // 加噪声的观测数据
         math::YpdCoord true_ypd = math::xyz_to_ypd(pos);
         math::YpdCoord meas_ypd;
-        meas_ypd.yaw = true_ypd.yaw + 0.01 * (rand() / (double)RAND_MAX - 0.5);
-        meas_ypd.pitch = true_ypd.pitch + 0.01 * (rand() / (double)RAND_MAX - 0.5);
-        meas_ypd.dis = true_ypd.dis + 0.01 * (rand() / (double)RAND_MAX - 0.5);
+        meas_ypd.yaw = true_ypd.yaw + 0.0 * (rand() / (double)RAND_MAX - 0.5);
+        meas_ypd.pitch = true_ypd.pitch + 0.0 * (rand() / (double)RAND_MAX - 0.5);
+        meas_ypd.dis = true_ypd.dis + 0.0 * (rand() / (double)RAND_MAX - 0.5);
 
         measurements.push_back(meas_ypd);
     }
@@ -60,8 +60,8 @@ std::vector<math::YpdCoord> generate_measurements(double dt, double total_time) 
 
 int main() {
     // 参数设置
-    const double dt = 0.1;
-    const double total_time = 50.0;
+    const double dt = 0.01;
+    const double total_time = 200.0;
     const int steps = total_time / dt;
 
     // 生成测试数据
